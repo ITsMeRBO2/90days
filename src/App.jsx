@@ -8,7 +8,7 @@ import {
 } from 'recharts';
 
 /* ---------------------------------------------------------------------- */
-/* Polyfill window.storage & Resilient Cloud Storage Engine               */
+/* Polyfill window.storage & Resilient Cloud Storage API                  */
 /* ---------------------------------------------------------------------- */
 if (typeof window !== 'undefined' && !window.storage) {
   window.storage = {
@@ -22,59 +22,61 @@ if (typeof window !== 'undefined' && !window.storage) {
   };
 }
 
-const KEY_PREFIX = 'v90days_rahil_';
+const KEY_PREFIX = 'v90days_rahil_v3_';
+
+function compressDays(data) {
+  if (!data) return {};
+  const result = {};
+  for (const [idx, day] of Object.entries(data)) {
+    if (day && (day.breakfast || day.lunch || day.dinner || day.steps || day.type || day.caloriesBurnt || day.cardioOn)) {
+      result[idx] = day;
+    }
+  }
+  return result;
+}
 
 async function fetchCloudData(pin, key) {
   const pinKey = `${KEY_PREFIX}${pin}_${key}`;
 
-  // 1. Try keyvalue.imsky.org
   try {
     const res = await fetch(`https://keyvalue.imsky.org/api/current/get/${pinKey}`, { cache: 'no-store' });
     if (res.ok) {
       const text = await res.text();
-      if (text && text.trim() !== '' && text !== '""' && text !== 'null') {
-        const decoded = decodeURIComponent(text.replace(/^"|"$/g, ''));
-        const parsed = JSON.parse(decoded);
-        if (parsed && typeof parsed === 'object') return parsed;
+      if (text && text !== '""' && text !== 'null' && text.trim().length > 0) {
+        let unquoted = text;
+        if (typeof unquoted === 'string' && unquoted.startsWith('"') && unquoted.endsWith('"')) {
+          try { unquoted = JSON.parse(unquoted); } catch (e) {}
+        }
+        if (typeof unquoted === 'string') {
+          try {
+            return JSON.parse(unquoted);
+          } catch (e) {
+            return JSON.parse(decodeURIComponent(unquoted));
+          }
+        } else if (typeof unquoted === 'object') {
+          return unquoted;
+        }
       }
     }
-  } catch (e) { /* silencieux */ }
-
-  // 2. Try kvdb.io
-  try {
-    const res = await fetch(`https://kvdb.io/4y9e7ZqR4tX8uW9v3m1k2L/${pinKey}`, { cache: 'no-store' });
-    if (res.ok) {
-      const text = await res.text();
-      if (text && text.trim() !== '') {
-        const parsed = JSON.parse(text);
-        if (parsed && typeof parsed === 'object') return parsed;
-      }
-    }
-  } catch (e) { /* silencieux */ }
-
+  } catch (e) {
+    console.warn('Cloud fetch warning:', e);
+  }
   return null;
 }
 
 async function saveCloudData(pin, key, value) {
   const pinKey = `${KEY_PREFIX}${pin}_${key}`;
-  const strVal = JSON.stringify(value);
+  const compressedVal = key === 'jours' ? compressDays(value) : value;
+  const strVal = JSON.stringify(compressedVal);
   const encodedVal = encodeURIComponent(strVal);
 
-  // 1. Save to keyvalue.imsky.org
   try {
-    await fetch(`https://keyvalue.imsky.org/api/current/set/${pinKey}/${encodedVal}`, {
-      method: 'POST'
-    });
-  } catch (e) { /* silencieux */ }
-
-  // 2. Save to kvdb.io
-  try {
-    await fetch(`https://kvdb.io/4y9e7ZqR4tX8uW9v3m1k2L/${pinKey}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: strVal,
-    });
-  } catch (e) { /* silencieux */ }
+    const res = await fetch(`https://keyvalue.imsky.org/api/current/set/${pinKey}/${encodedVal}`);
+    return res.ok;
+  } catch (e) {
+    console.warn('Cloud save warning:', e);
+    return false;
+  }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -113,7 +115,6 @@ const ALL_DAYS = Array.from({ length: TOTAL_DAYS }, (_, i) => {
 
 const END_DATE = ALL_DAYS[TOTAL_DAYS - 1].date;
 
-// Regroupement en semaines de 7 jours (la dernière semaine peut être plus courte)
 const WEEKS = (() => {
   const w = [];
   for (let i = 0; i < ALL_DAYS.length; i += 7) {
@@ -132,7 +133,7 @@ function todayDayIndex() {
 }
 
 function weekIndexForDay(dayIndex) {
-  return Math.floor((dayIndex - 1) / 7); // index 0-based dans WEEKS
+  return Math.floor((dayIndex - 1) / 7);
 }
 
 const WORKOUT_TYPES = [
@@ -198,7 +199,7 @@ export default function App() {
     saveHideTimer.current = setTimeout(() => setSaveVisible(false), 1400);
   }, []);
 
-  /* --- Chargement explicite depuis le Cloud --- */
+  /* --- Chargement depuis le Cloud avec le PIN --- */
   const loadFromCloud = useCallback(async (pinToUse) => {
     const targetPin = pinToUse || pinCode || '0000';
     setSyncing(true);
@@ -212,13 +213,13 @@ export default function App() {
       let hasData = false;
 
       if (cloudJours && typeof cloudJours === 'object' && Object.keys(cloudJours).length > 0) {
-        setDaysData(cloudJours);
+        setDaysData(prev => ({ ...prev, ...cloudJours }));
         localStorage.setItem('jours', JSON.stringify(cloudJours));
         hasData = true;
       }
 
       if (cloudPoids && typeof cloudPoids === 'object' && Object.keys(cloudPoids).length > 0) {
-        setWeeklyWeights(cloudPoids);
+        setWeeklyWeights(prev => ({ ...prev, ...cloudPoids }));
         localStorage.setItem('poids', JSON.stringify(cloudPoids));
         hasData = true;
       }
@@ -233,14 +234,13 @@ export default function App() {
     }
   }, [pinCode]);
 
-  /* --- Initialisation séquentielle (Empêche l'écrasement des données au démarrage) --- */
+  /* --- Initialisation séquentielle sans écrasement --- */
   useEffect(() => {
     let cancelled = false;
     (async () => {
       let localJoursData = null;
       let localPoidsData = null;
 
-      // 1. Restauration locale rapide
       try {
         const localJours = localStorage.getItem('jours');
         if (localJours) {
@@ -257,7 +257,6 @@ export default function App() {
         }
       } catch (e) {}
 
-      // 2. Synchro Cloud prioritaire
       const activePin = localStorage.getItem('pin_code') || '0000';
       try {
         const [cloudJours, cloudPoids] = await Promise.all([
@@ -267,15 +266,14 @@ export default function App() {
 
         if (!cancelled) {
           if (cloudJours && Object.keys(cloudJours).length > 0) {
-            setDaysData(cloudJours);
+            setDaysData(prev => ({ ...prev, ...cloudJours }));
             localStorage.setItem('jours', JSON.stringify(cloudJours));
           } else if (localJoursData && Object.keys(localJoursData).length > 0) {
-            // Envoyer le local vers le Cloud si le Cloud était vide
             await saveCloudData(activePin, 'jours', localJoursData);
           }
 
           if (cloudPoids && Object.keys(cloudPoids).length > 0) {
-            setWeeklyWeights(cloudPoids);
+            setWeeklyWeights(prev => ({ ...prev, ...cloudPoids }));
             localStorage.setItem('poids', JSON.stringify(cloudPoids));
           } else if (localPoidsData && Object.keys(localPoidsData).length > 0) {
             await saveCloudData(activePin, 'poids', localPoidsData);
@@ -297,13 +295,12 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
-  /* --- Changement de PIN --- */
   const handlePinChange = (newPin) => {
     setPinCode(newPin);
     localStorage.setItem('pin_code', newPin);
   };
 
-  /* --- Sauvegarde automatique (Déclenchée UNIQUEMENT après synchro initiale réussie) --- */
+  /* --- Sauvegarde automatique post-initialisation --- */
   useEffect(() => {
     if (!loaded || !cloudReady || isInitialMount.current) return;
 
@@ -311,11 +308,9 @@ export default function App() {
 
     saveTimer.current = setTimeout(async () => {
       try {
-        // Enregistrement Local
         localStorage.setItem('jours', JSON.stringify(daysData));
         localStorage.setItem('poids', JSON.stringify(weeklyWeights));
 
-        // Enregistrement Cloud
         setSyncStatus('saving');
         const activePin = pinCode || '0000';
         await saveCloudData(activePin, 'jours', daysData);
@@ -325,7 +320,7 @@ export default function App() {
       } catch (e) {
         setSyncStatus('error');
       }
-    }, 600);
+    }, 500);
 
     return () => clearTimeout(saveTimer.current);
   }, [daysData, weeklyWeights, loaded, cloudReady, pinCode, flashSaved]);
@@ -416,7 +411,7 @@ export default function App() {
 
           <div className="cloud-status">
             {syncStatus === 'synced' && <><Check size={14} className="status-check" /> Synchro Cloud Active (PIN: <strong>{pinCode || '0000'}</strong>)</>}
-            {syncStatus === 'loading' && <><RefreshCw size={14} className="spin" /> Récupération du Cloud...</>}
+            {syncStatus === 'loading' && <><RefreshCw size={14} className="spin" /> Connexion au Cloud...</>}
             {syncStatus === 'saving' && <><Cloud size={14} /> Enregistrement Cloud...</>}
             {syncStatus === 'error' && <span className="error-text">Mode Hors-ligne (Données locales conservées)</span>}
           </div>
@@ -828,7 +823,7 @@ const STYLES = `
   font-family: 'Big Shoulders Display', sans-serif; font-size: 15px;
 }
 .weight-input:focus { outline: none; border-color: var(--blue); }
-.week-weight .unit { font-size: 12px; color: var(--text-faint); }
+.weight-input .unit { font-size: 12px; color: var(--text-faint); }
 
 .week-right { display: flex; align-items: center; gap: 12px; margin-left: auto; }
 .week-progress { font-size: 12.5px; color: var(--text-dim); white-space: nowrap; }
