@@ -1,14 +1,14 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   UtensilsCrossed, Dumbbell, Flame, Footprints, Activity,
-  ChevronDown, Check, Scale, Sunrise, Sun, Moon
+  ChevronDown, Check, Scale, Sunrise, Sun, Moon, Cloud, RefreshCw, Lock
 } from 'lucide-react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from 'recharts';
 
 /* ---------------------------------------------------------------------- */
-/* Polyfill window.storage                                                */
+/* Polyfill window.storage & Cloud Storage API (PIN 0000 Cloud Sync)      */
 /* ---------------------------------------------------------------------- */
 if (typeof window !== 'undefined' && !window.storage) {
   window.storage = {
@@ -20,6 +20,48 @@ if (typeof window !== 'undefined' && !window.storage) {
       localStorage.setItem(key, val);
     },
   };
+}
+
+const CLOUD_BUCKET = 'v90days_rahil_prod_2026';
+
+async function fetchCloudData(pin, key) {
+  const pinKey = `${pin}_${key}`;
+  // 1. Try kvdb.io
+  try {
+    const res = await fetch(`https://kvdb.io/4y9e7ZqR4tX8uW9v3m1k2L/${pinKey}`, { cache: 'no-cache' });
+    if (res.ok) {
+      const text = await res.text();
+      if (text && text.trim() !== '') return JSON.parse(text);
+    }
+  } catch (e) { /* silencieux */ }
+
+  // 2. Fallback keyval API
+  try {
+    const res = await fetch(`https://api.keyval.org/get/${CLOUD_BUCKET}_${pinKey}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.value) return JSON.parse(data.value);
+    }
+  } catch (e) { /* silencieux */ }
+
+  return null;
+}
+
+async function saveCloudData(pin, key, value) {
+  const pinKey = `${pin}_${key}`;
+  const strVal = JSON.stringify(value);
+
+  try {
+    await fetch(`https://kvdb.io/4y9e7ZqR4tX8uW9v3m1k2L/${pinKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: strVal,
+    });
+  } catch (e) { /* silencieux */ }
+
+  try {
+    await fetch(`https://api.keyval.org/set/${CLOUD_BUCKET}_${pinKey}/${encodeURIComponent(strVal)}`);
+  } catch (e) { /* silencieux */ }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -121,6 +163,11 @@ export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [saveVisible, setSaveVisible] = useState(false);
 
+  /* --- Code PIN Cloud (Défaut : 0000) --- */
+  const [pinCode, setPinCode] = useState(() => localStorage.getItem('pin_code') || '0000');
+  const [syncStatus, setSyncStatus] = useState('synced'); // 'synced' | 'loading' | 'saving' | 'error'
+  const [syncing, setSyncing] = useState(false);
+
   const defaultDay = todayDayIndex();
   const defaultWeek = weekIndexForDay(defaultDay);
 
@@ -130,53 +177,102 @@ export default function App() {
   const saveTimer = useRef(null);
   const saveHideTimer = useRef(null);
 
-  /* --- chargement initial depuis le stockage persistant --- */
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await window.storage.get('jours');
-        if (!cancelled && res && res.value) setDaysData(JSON.parse(res.value));
-      } catch (e) { /* pas encore de données */ }
-      try {
-        const res = await window.storage.get('poids');
-        if (!cancelled && res && res.value) setWeeklyWeights(JSON.parse(res.value));
-      } catch (e) { /* pas encore de données, on garde {1:'82'} */ }
-      if (!cancelled) setLoaded(true);
-    })();
-    return () => { cancelled = true; };
-  }, []);
-
   const flashSaved = useCallback(() => {
     setSaveVisible(true);
     if (saveHideTimer.current) clearTimeout(saveHideTimer.current);
     saveHideTimer.current = setTimeout(() => setSaveVisible(false), 1400);
   }, []);
 
-  /* --- sauvegarde (debounce) --- */
-  useEffect(() => {
-    if (!loaded) return;
-    if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(async () => {
-      try {
-        await window.storage.set('jours', JSON.stringify(daysData));
-        flashSaved();
-      } catch (e) { /* silencieux */ }
-    }, 500);
-    return () => clearTimeout(saveTimer.current);
-  }, [daysData, loaded, flashSaved]);
+  /* --- Chargement depuis Cloud + Local --- */
+  const loadFromCloud = useCallback(async (pinToUse) => {
+    const targetPin = pinToUse || pinCode || '0000';
+    setSyncing(true);
+    setSyncStatus('loading');
+    try {
+      const [cloudJours, cloudPoids] = await Promise.all([
+        fetchCloudData(targetPin, 'jours'),
+        fetchCloudData(targetPin, 'poids')
+      ]);
 
+      let hasCloudData = false;
+
+      if (cloudJours && typeof cloudJours === 'object' && Object.keys(cloudJours).length > 0) {
+        setDaysData(cloudJours);
+        localStorage.setItem('jours', JSON.stringify(cloudJours));
+        hasCloudData = true;
+      }
+
+      if (cloudPoids && typeof cloudPoids === 'object' && Object.keys(cloudPoids).length > 0) {
+        setWeeklyWeights(cloudPoids);
+        localStorage.setItem('poids', JSON.stringify(cloudPoids));
+        hasCloudData = true;
+      }
+
+      setSyncStatus('synced');
+      return hasCloudData;
+    } catch (e) {
+      setSyncStatus('error');
+      return false;
+    } finally {
+      setSyncing(false);
+    }
+  }, [pinCode]);
+
+  /* --- initialisation --- */
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      // 1. Chargement instantané depuis localStorage
+      try {
+        const localJours = localStorage.getItem('jours');
+        if (localJours) setDaysData(JSON.parse(localJours));
+      } catch (e) {}
+      try {
+        const localPoids = localStorage.getItem('poids');
+        if (localPoids) setWeeklyWeights(JSON.parse(localPoids));
+      } catch (e) {}
+
+      if (!cancelled) setLoaded(true);
+
+      // 2. Synchro automatique avec le Cloud (PIN 0000)
+      if (!cancelled) {
+        await loadFromCloud(pinCode);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  /* --- Changement du code PIN --- */
+  const handlePinChange = (newPin) => {
+    setPinCode(newPin);
+    localStorage.setItem('pin_code', newPin);
+  };
+
+  /* --- Sauvegarde automatique (Debounce Local + Cloud) --- */
   useEffect(() => {
     if (!loaded) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
+
     saveTimer.current = setTimeout(async () => {
       try {
-        await window.storage.set('poids', JSON.stringify(weeklyWeights));
+        // Local
+        localStorage.setItem('jours', JSON.stringify(daysData));
+        localStorage.setItem('poids', JSON.stringify(weeklyWeights));
+
+        // Cloud
+        setSyncStatus('saving');
+        const activePin = pinCode || '0000';
+        await saveCloudData(activePin, 'jours', daysData);
+        await saveCloudData(activePin, 'poids', weeklyWeights);
+        setSyncStatus('synced');
         flashSaved();
-      } catch (e) { /* silencieux */ }
-    }, 500);
+      } catch (e) {
+        setSyncStatus('error');
+      }
+    }, 600);
+
     return () => clearTimeout(saveTimer.current);
-  }, [weeklyWeights, loaded, flashSaved]);
+  }, [daysData, weeklyWeights, loaded, pinCode, flashSaved]);
 
   const updateDay = (index, patch) => {
     setDaysData(prev => ({
@@ -234,6 +330,40 @@ export default function App() {
           <span>{fmtDate(END_DATE)}</span>
           <span className="dot">&middot;</span>
           <span>Jour {currentDayIdx} sur {TOTAL_DAYS}</span>
+        </div>
+
+        {/* BARRE DE SYNCHRONISATION CLOUD (PIN 0000) */}
+        <div className="cloud-sync-bar">
+          <div className="cloud-pin-wrap">
+            <span className="cloud-icon"><Cloud size={17} /></span>
+            <span className="cloud-label">Code PIN Cloud :</span>
+            <input
+              type="text"
+              className="pin-input"
+              value={pinCode}
+              maxLength={6}
+              onChange={(e) => handlePinChange(e.target.value)}
+              placeholder="0000"
+              title="Code PIN pour synchroniser entre plusieurs navigateurs ou appareils"
+            />
+            <button
+              type="button"
+              className="sync-btn"
+              onClick={() => loadFromCloud(pinCode)}
+              disabled={syncing}
+              title="Charger les données enregistrées dans le Cloud"
+            >
+              <RefreshCw size={14} className={syncing ? 'spin' : ''} />
+              {syncing ? 'Synchro...' : 'Recharger'}
+            </button>
+          </div>
+
+          <div className="cloud-status">
+            {syncStatus === 'synced' && <><Check size={14} className="status-check" /> Synchronisé Cloud (PIN: <strong>{pinCode || '0000'}</strong>)</>}
+            {syncStatus === 'loading' && <><RefreshCw size={14} className="spin" /> Connexion au Cloud...</>}
+            {syncStatus === 'saving' && <><Cloud size={14} /> Enregistrement Cloud...</>}
+            {syncStatus === 'error' && <span className="error-text">Synchro Cloud indisponible (mode local actif)</span>}
+          </div>
         </div>
 
         <div className="tick-overview" aria-hidden="true">
@@ -353,7 +483,7 @@ export default function App() {
 
       <div className={'save-badge' + (saveVisible ? ' show' : '')}>
         <Check size={14} strokeWidth={3} />
-        <span>Enregistré</span>
+        <span>Enregistré &amp; Synchro</span>
       </div>
     </div>
   );
@@ -537,10 +667,40 @@ const STYLES = `
 }
 .hero-dates {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  color: var(--text-dim); font-size: 14.5px; margin-bottom: 22px;
+  color: var(--text-dim); font-size: 14.5px; margin-bottom: 18px;
 }
 .hero-dates .arrow { color: var(--text-faint); }
 .hero-dates .dot { color: var(--text-faint); }
+
+/* ---------- cloud sync bar ---------- */
+.cloud-sync-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  background: var(--surface-2); border: 1px solid var(--border-strong);
+  border-radius: 10px; padding: 10px 16px; margin-bottom: 22px; flex-wrap: wrap;
+}
+.cloud-pin-wrap { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cloud-icon { color: var(--blue); display: flex; align-items: center; }
+.cloud-label { font-size: 13.5px; font-weight: 600; color: var(--text); }
+.pin-input {
+  width: 65px; background: var(--surface); border: 1px solid var(--amber-border);
+  border-radius: 6px; padding: 4px 6px; color: var(--amber);
+  font-family: 'Big Shoulders Display', sans-serif; font-size: 16px; font-weight: 800;
+  text-align: center; letter-spacing: 1px;
+}
+.pin-input:focus { outline: none; border-color: var(--amber); }
+.sync-btn {
+  display: flex; align-items: center; gap: 6px; background: var(--blue-soft);
+  color: var(--blue); border: 1px solid var(--blue-border); border-radius: 6px;
+  padding: 5px 12px; font-size: 12.5px; font-weight: 700; cursor: pointer;
+  transition: all 0.15s ease;
+}
+.sync-btn:hover { background: var(--blue); color: #0b0d10; }
+.sync-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+.cloud-status { font-size: 12.5px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; }
+.status-check { color: var(--green); }
+.error-text { color: #ff6b6b; }
+.spin { animation: spin 1s linear infinite; }
+@keyframes spin { 100% { transform: rotate(360deg); } }
 
 .tick-overview {
   display: grid;
