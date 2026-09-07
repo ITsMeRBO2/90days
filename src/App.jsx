@@ -1,14 +1,14 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   UtensilsCrossed, Dumbbell, Flame, Footprints, Activity,
-  ChevronDown, Check, Scale, Sunrise, Sun, Moon, Cloud, RefreshCw, Lock
+  ChevronDown, Check, Scale, Sunrise, Sun, Moon, Cloud, RefreshCw
 } from 'lucide-react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from 'recharts';
 
 /* ---------------------------------------------------------------------- */
-/* Polyfill window.storage & Cloud Storage API (PIN 0000 Cloud Sync)      */
+/* Polyfill window.storage & Resilient Cloud Storage Engine               */
 /* ---------------------------------------------------------------------- */
 if (typeof window !== 'undefined' && !window.storage) {
   window.storage = {
@@ -22,25 +22,33 @@ if (typeof window !== 'undefined' && !window.storage) {
   };
 }
 
-const CLOUD_BUCKET = 'v90days_rahil_prod_2026';
+const KEY_PREFIX = 'v90days_rahil_';
 
 async function fetchCloudData(pin, key) {
-  const pinKey = `${pin}_${key}`;
-  // 1. Try kvdb.io
+  const pinKey = `${KEY_PREFIX}${pin}_${key}`;
+
+  // 1. Try keyvalue.imsky.org
   try {
-    const res = await fetch(`https://kvdb.io/4y9e7ZqR4tX8uW9v3m1k2L/${pinKey}`, { cache: 'no-cache' });
+    const res = await fetch(`https://keyvalue.imsky.org/api/current/get/${pinKey}`, { cache: 'no-store' });
     if (res.ok) {
       const text = await res.text();
-      if (text && text.trim() !== '') return JSON.parse(text);
+      if (text && text.trim() !== '' && text !== '""' && text !== 'null') {
+        const decoded = decodeURIComponent(text.replace(/^"|"$/g, ''));
+        const parsed = JSON.parse(decoded);
+        if (parsed && typeof parsed === 'object') return parsed;
+      }
     }
   } catch (e) { /* silencieux */ }
 
-  // 2. Fallback keyval API
+  // 2. Try kvdb.io
   try {
-    const res = await fetch(`https://api.keyval.org/get/${CLOUD_BUCKET}_${pinKey}`);
+    const res = await fetch(`https://kvdb.io/4y9e7ZqR4tX8uW9v3m1k2L/${pinKey}`, { cache: 'no-store' });
     if (res.ok) {
-      const data = await res.json();
-      if (data && data.value) return JSON.parse(data.value);
+      const text = await res.text();
+      if (text && text.trim() !== '') {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === 'object') return parsed;
+      }
     }
   } catch (e) { /* silencieux */ }
 
@@ -48,19 +56,24 @@ async function fetchCloudData(pin, key) {
 }
 
 async function saveCloudData(pin, key, value) {
-  const pinKey = `${pin}_${key}`;
+  const pinKey = `${KEY_PREFIX}${pin}_${key}`;
   const strVal = JSON.stringify(value);
+  const encodedVal = encodeURIComponent(strVal);
 
+  // 1. Save to keyvalue.imsky.org
+  try {
+    await fetch(`https://keyvalue.imsky.org/api/current/set/${pinKey}/${encodedVal}`, {
+      method: 'POST'
+    });
+  } catch (e) { /* silencieux */ }
+
+  // 2. Save to kvdb.io
   try {
     await fetch(`https://kvdb.io/4y9e7ZqR4tX8uW9v3m1k2L/${pinKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: strVal,
     });
-  } catch (e) { /* silencieux */ }
-
-  try {
-    await fetch(`https://api.keyval.org/set/${CLOUD_BUCKET}_${pinKey}/${encodeURIComponent(strVal)}`);
   } catch (e) { /* silencieux */ }
 }
 
@@ -161,11 +174,12 @@ export default function App() {
   const [daysData, setDaysData] = useState({});
   const [weeklyWeights, setWeeklyWeights] = useState({ 1: '82' });
   const [loaded, setLoaded] = useState(false);
+  const [cloudReady, setCloudReady] = useState(false);
   const [saveVisible, setSaveVisible] = useState(false);
 
   /* --- Code PIN Cloud (Défaut : 0000) --- */
   const [pinCode, setPinCode] = useState(() => localStorage.getItem('pin_code') || '0000');
-  const [syncStatus, setSyncStatus] = useState('synced'); // 'synced' | 'loading' | 'saving' | 'error'
+  const [syncStatus, setSyncStatus] = useState('loading'); // 'synced' | 'loading' | 'saving' | 'error'
   const [syncing, setSyncing] = useState(false);
 
   const defaultDay = todayDayIndex();
@@ -176,6 +190,7 @@ export default function App() {
 
   const saveTimer = useRef(null);
   const saveHideTimer = useRef(null);
+  const isInitialMount = useRef(true);
 
   const flashSaved = useCallback(() => {
     setSaveVisible(true);
@@ -183,7 +198,7 @@ export default function App() {
     saveHideTimer.current = setTimeout(() => setSaveVisible(false), 1400);
   }, []);
 
-  /* --- Chargement depuis Cloud + Local --- */
+  /* --- Chargement explicite depuis le Cloud --- */
   const loadFromCloud = useCallback(async (pinToUse) => {
     const targetPin = pinToUse || pinCode || '0000';
     setSyncing(true);
@@ -194,22 +209,22 @@ export default function App() {
         fetchCloudData(targetPin, 'poids')
       ]);
 
-      let hasCloudData = false;
+      let hasData = false;
 
       if (cloudJours && typeof cloudJours === 'object' && Object.keys(cloudJours).length > 0) {
         setDaysData(cloudJours);
         localStorage.setItem('jours', JSON.stringify(cloudJours));
-        hasCloudData = true;
+        hasData = true;
       }
 
       if (cloudPoids && typeof cloudPoids === 'object' && Object.keys(cloudPoids).length > 0) {
         setWeeklyWeights(cloudPoids);
         localStorage.setItem('poids', JSON.stringify(cloudPoids));
-        hasCloudData = true;
+        hasData = true;
       }
 
       setSyncStatus('synced');
-      return hasCloudData;
+      return hasData;
     } catch (e) {
       setSyncStatus('error');
       return false;
@@ -218,48 +233,89 @@ export default function App() {
     }
   }, [pinCode]);
 
-  /* --- initialisation --- */
+  /* --- Initialisation séquentielle (Empêche l'écrasement des données au démarrage) --- */
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      // 1. Chargement instantané depuis localStorage
+      let localJoursData = null;
+      let localPoidsData = null;
+
+      // 1. Restauration locale rapide
       try {
         const localJours = localStorage.getItem('jours');
-        if (localJours) setDaysData(JSON.parse(localJours));
+        if (localJours) {
+          localJoursData = JSON.parse(localJours);
+          setDaysData(localJoursData);
+        }
       } catch (e) {}
+
       try {
         const localPoids = localStorage.getItem('poids');
-        if (localPoids) setWeeklyWeights(JSON.parse(localPoids));
+        if (localPoids) {
+          localPoidsData = JSON.parse(localPoids);
+          setWeeklyWeights(localPoidsData);
+        }
       } catch (e) {}
 
-      if (!cancelled) setLoaded(true);
+      // 2. Synchro Cloud prioritaire
+      const activePin = localStorage.getItem('pin_code') || '0000';
+      try {
+        const [cloudJours, cloudPoids] = await Promise.all([
+          fetchCloudData(activePin, 'jours'),
+          fetchCloudData(activePin, 'poids')
+        ]);
 
-      // 2. Synchro automatique avec le Cloud (PIN 0000)
-      if (!cancelled) {
-        await loadFromCloud(pinCode);
+        if (!cancelled) {
+          if (cloudJours && Object.keys(cloudJours).length > 0) {
+            setDaysData(cloudJours);
+            localStorage.setItem('jours', JSON.stringify(cloudJours));
+          } else if (localJoursData && Object.keys(localJoursData).length > 0) {
+            // Envoyer le local vers le Cloud si le Cloud était vide
+            await saveCloudData(activePin, 'jours', localJoursData);
+          }
+
+          if (cloudPoids && Object.keys(cloudPoids).length > 0) {
+            setWeeklyWeights(cloudPoids);
+            localStorage.setItem('poids', JSON.stringify(cloudPoids));
+          } else if (localPoidsData && Object.keys(localPoidsData).length > 0) {
+            await saveCloudData(activePin, 'poids', localPoidsData);
+          }
+
+          setSyncStatus('synced');
+        }
+      } catch (e) {
+        if (!cancelled) setSyncStatus('error');
+      } finally {
+        if (!cancelled) {
+          setLoaded(true);
+          setCloudReady(true);
+          isInitialMount.current = false;
+        }
       }
     })();
+
     return () => { cancelled = true; };
   }, []);
 
-  /* --- Changement du code PIN --- */
+  /* --- Changement de PIN --- */
   const handlePinChange = (newPin) => {
     setPinCode(newPin);
     localStorage.setItem('pin_code', newPin);
   };
 
-  /* --- Sauvegarde automatique (Debounce Local + Cloud) --- */
+  /* --- Sauvegarde automatique (Déclenchée UNIQUEMENT après synchro initiale réussie) --- */
   useEffect(() => {
-    if (!loaded) return;
+    if (!loaded || !cloudReady || isInitialMount.current) return;
+
     if (saveTimer.current) clearTimeout(saveTimer.current);
 
     saveTimer.current = setTimeout(async () => {
       try {
-        // Local
+        // Enregistrement Local
         localStorage.setItem('jours', JSON.stringify(daysData));
         localStorage.setItem('poids', JSON.stringify(weeklyWeights));
 
-        // Cloud
+        // Enregistrement Cloud
         setSyncStatus('saving');
         const activePin = pinCode || '0000';
         await saveCloudData(activePin, 'jours', daysData);
@@ -272,7 +328,7 @@ export default function App() {
     }, 600);
 
     return () => clearTimeout(saveTimer.current);
-  }, [daysData, weeklyWeights, loaded, pinCode, flashSaved]);
+  }, [daysData, weeklyWeights, loaded, cloudReady, pinCode, flashSaved]);
 
   const updateDay = (index, patch) => {
     setDaysData(prev => ({
@@ -332,11 +388,11 @@ export default function App() {
           <span>Jour {currentDayIdx} sur {TOTAL_DAYS}</span>
         </div>
 
-        {/* BARRE DE SYNCHRONISATION CLOUD (PIN 0000) */}
+        {/* BARRE DE SYNCHRONISATION CLOUD */}
         <div className="cloud-sync-bar">
           <div className="cloud-pin-wrap">
             <span className="cloud-icon"><Cloud size={17} /></span>
-            <span className="cloud-label">Code PIN Cloud :</span>
+            <span className="cloud-label">Code PIN Synchro :</span>
             <input
               type="text"
               className="pin-input"
@@ -344,14 +400,14 @@ export default function App() {
               maxLength={6}
               onChange={(e) => handlePinChange(e.target.value)}
               placeholder="0000"
-              title="Code PIN pour synchroniser entre plusieurs navigateurs ou appareils"
+              title="Saisissez ce même code PIN sur n'importe quel navigateur pour retrouver vos données"
             />
             <button
               type="button"
               className="sync-btn"
               onClick={() => loadFromCloud(pinCode)}
               disabled={syncing}
-              title="Charger les données enregistrées dans le Cloud"
+              title="Charger les données enregistrées dans le Cloud avec ce PIN"
             >
               <RefreshCw size={14} className={syncing ? 'spin' : ''} />
               {syncing ? 'Synchro...' : 'Recharger'}
@@ -359,10 +415,10 @@ export default function App() {
           </div>
 
           <div className="cloud-status">
-            {syncStatus === 'synced' && <><Check size={14} className="status-check" /> Synchronisé Cloud (PIN: <strong>{pinCode || '0000'}</strong>)</>}
-            {syncStatus === 'loading' && <><RefreshCw size={14} className="spin" /> Connexion au Cloud...</>}
+            {syncStatus === 'synced' && <><Check size={14} className="status-check" /> Synchro Cloud Active (PIN: <strong>{pinCode || '0000'}</strong>)</>}
+            {syncStatus === 'loading' && <><RefreshCw size={14} className="spin" /> Récupération du Cloud...</>}
             {syncStatus === 'saving' && <><Cloud size={14} /> Enregistrement Cloud...</>}
-            {syncStatus === 'error' && <span className="error-text">Synchro Cloud indisponible (mode local actif)</span>}
+            {syncStatus === 'error' && <span className="error-text">Mode Hors-ligne (Données locales conservées)</span>}
           </div>
         </div>
 
@@ -483,7 +539,7 @@ export default function App() {
 
       <div className={'save-badge' + (saveVisible ? ' show' : '')}>
         <Check size={14} strokeWidth={3} />
-        <span>Enregistré &amp; Synchro</span>
+        <span>Enregistré &amp; Synchro Cloud</span>
       </div>
     </div>
   );
