@@ -2,7 +2,8 @@ import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import {
   UtensilsCrossed, Dumbbell, Flame, Footprints, Activity,
   ChevronDown, Check, Scale, Sunrise, Sun, Moon, Cloud, RefreshCw,
-  Download, Upload, Copy, FileText, CloudUpload, CloudDownload
+  Download, Upload, Copy, FileText, CloudUpload, CloudDownload,
+  Target, AlertTriangle, CheckCircle2
 } from 'lucide-react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
@@ -25,6 +26,7 @@ if (typeof window !== 'undefined' && !window.storage) {
 
 const KV_BUCKET = 'v90days_rahil_v4';
 const IMSKY_PREFIX = 'v90days_rahil_v3_';
+const CALORIE_GOAL = 2000;
 
 function compressDays(data) {
   if (!data) return {};
@@ -378,7 +380,6 @@ export default function App() {
   };
 
   const handlePinBlur = () => {
-    // Recharger depuis le cloud dès qu'on sort du champ PIN
     loadFromCloud(pinCode);
   };
 
@@ -568,13 +569,25 @@ export default function App() {
   /* --- statistiques globales --- */
   const stats = useMemo(() => {
     let calIn = 0, calOut = 0, stepsSum = 0, stepsDays = 0, logged = 0;
+    let goalMetDays = 0, goalFailedDays = 0, calLoggedDays = 0;
+
     for (const day of ALL_DAYS) {
       const d = daysData[day.index];
       if (!d) continue;
-      calIn += num(d.breakfast) + num(d.lunch) + num(d.dinner);
+      const dayCalIn = num(d.breakfast) + num(d.lunch) + num(d.dinner);
+      calIn += dayCalIn;
       calOut += num(d.caloriesBurnt);
       if (d.steps) { stepsSum += num(d.steps); stepsDays += 1; }
       if (isDayStarted(d)) logged += 1;
+
+      if (dayCalIn > 0) {
+        calLoggedDays += 1;
+        if (dayCalIn <= CALORIE_GOAL) {
+          goalMetDays += 1;
+        } else {
+          goalFailedDays += 1;
+        }
+      }
     }
     const weightEntries = Object.entries(weeklyWeights)
       .filter(([, v]) => v !== '' && v !== undefined)
@@ -585,6 +598,7 @@ export default function App() {
     return {
       calIn, calOut, avgSteps: stepsDays ? Math.round(stepsSum / stepsDays) : 0,
       logged, lastWeight, delta,
+      goalMetDays, goalFailedDays, calLoggedDays
     };
   }, [daysData, weeklyWeights]);
 
@@ -717,7 +731,7 @@ export default function App() {
                 </div>
                 <div className="code-modal-divider" />
                 <div className="code-modal-step">
-                  <p><strong>Option 2 : Coller un code reçu d\'un autre appareil</strong></p>
+                  <p><strong>Option 2 : Coller un code reçu d'un autre appareil</strong></p>
                   <textarea
                     className="code-textarea"
                     placeholder="Collez ici le texte JSON de sauvegarde..."
@@ -763,6 +777,11 @@ export default function App() {
         <div className="stats-row">
           <Stat value={`${stats.logged}/${TOTAL_DAYS}`} label="Jours renseignés" />
           <Stat value={stats.calIn.toLocaleString('fr-FR')} label="Kcal consommées (total)" />
+          <Stat
+            value={`${stats.goalMetDays} / ${stats.calLoggedDays}`}
+            label="Objectif ≤ 2000 kcal"
+            sub={stats.goalFailedDays > 0 ? `⚠️ ${stats.goalFailedDays} jour(s) FAILED` : (stats.calLoggedDays > 0 ? '100% Réussi' : null)}
+          />
           <Stat value={stats.calOut.toLocaleString('fr-FR')} label="Kcal brûlées (total)" />
           <Stat value={stats.avgSteps.toLocaleString('fr-FR')} label="Pas / jour en moyenne" />
           <Stat
@@ -803,12 +822,42 @@ export default function App() {
           const isOpen = openWeek === wIdx;
           const doneCount = week.filter(d => isDayComplete(daysData[d.index])).length;
 
+          // Calcul des calories de la semaine
+          let weekCalMet = 0, weekCalFailed = 0, weekCalLogged = 0;
+          for (const dDay of week) {
+            const dData = daysData[dDay.index];
+            if (!dData) continue;
+            const dayCalIn = num(dData.breakfast) + num(dData.lunch) + num(dData.dinner);
+            if (dayCalIn > 0) {
+              weekCalLogged++;
+              if (dayCalIn <= CALORIE_GOAL) weekCalMet++;
+              else weekCalFailed++;
+            }
+          }
+
           return (
             <div key={wIdx} className={'week' + (isOpen ? ' open' : '')}>
               <div className="week-header" onClick={() => setOpenWeek(isOpen ? -1 : wIdx)}>
                 <div className="week-heading">
                   <span className="week-title">Semaine {weekNum}</span>
                   <span className="week-range">{fmtDateShort(first.date)} – {fmtDateShort(last.date)}</span>
+                </div>
+
+                {/* Badge Synthèse Calorie Semaine */}
+                <div className="week-cal-summary" onClick={(e) => e.stopPropagation()}>
+                  {weekCalFailed > 0 ? (
+                    <span className="week-cal-tag failed">
+                      <AlertTriangle size={13} /> {weekCalFailed} jour(s) FAILED (&gt;2000 kcal)
+                    </span>
+                  ) : weekCalLogged > 0 ? (
+                    <span className="week-cal-tag success">
+                      <CheckCircle2 size={13} /> {weekCalMet}/{weekCalLogged} jours &le; 2000 kcal
+                    </span>
+                  ) : (
+                    <span className="week-cal-tag neutral">
+                      <Target size={13} /> Max 2000 kcal/j
+                    </span>
+                  )}
                 </div>
 
                 <div className="week-weight" onClick={(e) => e.stopPropagation()}>
@@ -878,6 +927,10 @@ function DayCard({ day, data, isOpen, isToday, onToggle, onUpdate }) {
   const totalIn = num(d.breakfast) + num(d.lunch) + num(d.dinner);
   const balance = totalIn - num(d.caloriesBurnt);
 
+  const hasCalData = totalIn > 0;
+  const isFailed = hasCalData && totalIn > CALORIE_GOAL;
+  const isMet = hasCalData && totalIn <= CALORIE_GOAL;
+
   return (
     <div id={`day-${day.index}`} className={'day' + (isOpen ? ' open' : '')}>
       <div className="day-header" onClick={onToggle}>
@@ -888,6 +941,26 @@ function DayCard({ day, data, isOpen, isToday, onToggle, onUpdate }) {
           <span className="day-name">Jour {day.index}{isToday ? <em className="today-flag">aujourd'hui</em> : null}</span>
           <span className="day-date">{fmtWeekday(day.date)} {fmtDateShort(day.date)}</span>
         </div>
+
+        {/* Badge Objectif Jour (En-tête de jour) */}
+        <div className="day-goal-header">
+          {isFailed && (
+            <span className="day-cal-tag failed">
+              ❌ FAILED ({totalIn} / 2000 kcal)
+            </span>
+          )}
+          {isMet && (
+            <span className="day-cal-tag success">
+              ✅ Objectif Atteint ({totalIn} / 2000 kcal)
+            </span>
+          )}
+          {!hasCalData && (
+            <span className="day-cal-tag neutral">
+              🎯 Max 2000 kcal
+            </span>
+          )}
+        </div>
+
         <ChevronDown size={17} className="day-chevron" />
       </div>
 
@@ -907,6 +980,24 @@ function DayCard({ day, data, isOpen, isToday, onToggle, onUpdate }) {
             <div className="meal-total">
               <span>Total consommé</span>
               <span className="value">{totalIn.toLocaleString('fr-FR')} kcal</span>
+            </div>
+
+            {/* Jauge et statut d'objectif 2000 kcal */}
+            <div className={'diet-goal-card ' + (isFailed ? 'failed' : isMet ? 'success' : '')}>
+              <div className="diet-goal-header">
+                <span className="diet-goal-title"><Target size={14} /> Objectif Max : 2000 kcal</span>
+                <span className="diet-goal-status">
+                  {isFailed && `❌ FAILED (+${totalIn - CALORIE_GOAL} kcal)`}
+                  {isMet && `✅ ATTEINT (-${CALORIE_GOAL - totalIn} kcal)`}
+                  {!hasCalData && `0 / 2000 kcal`}
+                </span>
+              </div>
+              <div className="diet-progress-bg">
+                <div
+                  className={'diet-progress-fill ' + (isFailed ? 'failed' : 'success')}
+                  style={{ width: `${Math.min(100, (totalIn / CALORIE_GOAL) * 100)}%` }}
+                />
+              </div>
             </div>
           </div>
 
@@ -1187,6 +1278,15 @@ const STYLES = `
 .week-title { font-family: 'Big Shoulders Display', sans-serif; font-weight: 700; font-size: 1.25rem; }
 .week-range { color: var(--text-dim); font-size: 12.5px; }
 
+.week-cal-summary { margin-left: 10px; margin-right: auto; }
+.week-cal-tag {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 12px;
+}
+.week-cal-tag.success { background: rgba(111,191,115,0.15); color: #6fbf73; border: 1px solid rgba(111,191,115,0.3); }
+.week-cal-tag.failed { background: rgba(255,107,107,0.18); color: #ff6b6b; border: 1px solid rgba(255,107,107,0.4); }
+.week-cal-tag.neutral { background: rgba(255,255,255,0.06); color: var(--text-dim); border: 1px solid var(--border); }
+
 .week-weight { display: flex; align-items: center; gap: 6px; color: var(--text-dim); }
 .weight-input {
   width: 58px; background: var(--surface-2); border: 1px solid var(--border);
@@ -1227,6 +1327,16 @@ const STYLES = `
   background: var(--blue-soft); padding: 2px 7px; border-radius: 10px; font-weight: 700;
 }
 .day-date { color: var(--text-dim); font-size: 13px; }
+
+.day-goal-header { margin-left: auto; margin-right: 10px; }
+.day-cal-tag {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 12px; font-weight: 700; padding: 3px 9px; border-radius: 10px;
+}
+.day-cal-tag.success { background: rgba(111,191,115,0.15); color: #6fbf73; border: 1px solid rgba(111,191,115,0.3); }
+.day-cal-tag.failed { background: rgba(255,107,107,0.22); color: #ff6b6b; border: 1px solid rgba(255,107,107,0.45); }
+.day-cal-tag.neutral { background: rgba(255,255,255,0.05); color: var(--text-faint); }
+
 .day-chevron { color: var(--text-dim); transition: transform 0.25s ease; flex-shrink: 0; }
 .day.open .day-chevron { transform: rotate(180deg); }
 
@@ -1271,6 +1381,34 @@ const STYLES = `
 }
 .meal-total .value { font-family: 'Big Shoulders Display', sans-serif; font-size: 19px; color: var(--amber); font-weight: 700; }
 .meal-total.train-total .value.train-value { color: var(--blue); }
+
+/* Jauge et statut d'objectif calorie */
+.diet-goal-card {
+  margin-top: 14px; padding: 10px 12px; border-radius: 8px;
+  background: var(--surface); border: 1px solid var(--border);
+  transition: all 0.2s ease;
+}
+.diet-goal-card.success { border-color: rgba(111,191,115,0.4); background: rgba(111,191,115,0.06); }
+.diet-goal-card.failed { border-color: rgba(255,107,107,0.45); background: rgba(255,107,107,0.08); }
+
+.diet-goal-header {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  font-size: 12.5px; font-weight: 700; margin-bottom: 6px;
+}
+.diet-goal-title { display: flex; align-items: center; gap: 6px; color: var(--amber); }
+.diet-goal-status { font-size: 12px; }
+.diet-goal-card.success .diet-goal-status { color: #6fbf73; }
+.diet-goal-card.failed .diet-goal-status { color: #ff6b6b; font-weight: 800; }
+
+.diet-progress-bg {
+  width: 100%; height: 7px; background: rgba(255,255,255,0.1);
+  border-radius: 10px; overflow: hidden;
+}
+.diet-progress-fill {
+  height: 100%; border-radius: 10px; transition: width 0.3s ease;
+}
+.diet-progress-fill.success { background: linear-gradient(90deg, #6fbf73, #4c8dff); }
+.diet-progress-fill.failed { background: linear-gradient(90deg, #e0a438, #ff6b6b); }
 
 .cardio-toggle-row, .field-row {
   display: flex; align-items: center; justify-content: space-between; padding: 7px 0;
