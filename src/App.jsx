@@ -1,14 +1,15 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   UtensilsCrossed, Dumbbell, Flame, Footprints, Activity,
-  ChevronDown, Check, Scale, Sunrise, Sun, Moon, Cloud, RefreshCw
+  ChevronDown, Check, Scale, Sunrise, Sun, Moon, Cloud, RefreshCw,
+  Download, Upload, Copy, FileText, CloudUpload, CloudDownload
 } from 'lucide-react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from 'recharts';
 
 /* ---------------------------------------------------------------------- */
-/* Polyfill window.storage & Resilient Cloud Storage API                  */
+/* Polyfill window.storage & API Cloud Resiliente                          */
 /* ---------------------------------------------------------------------- */
 if (typeof window !== 'undefined' && !window.storage) {
   window.storage = {
@@ -22,24 +23,51 @@ if (typeof window !== 'undefined' && !window.storage) {
   };
 }
 
-const KEY_PREFIX = 'v90days_rahil_v3_';
+const KV_BUCKET = 'v90days_rahil_v4';
+const IMSKY_PREFIX = 'v90days_rahil_v3_';
 
 function compressDays(data) {
   if (!data) return {};
   const result = {};
   for (const [idx, day] of Object.entries(data)) {
-    if (day && (day.breakfast || day.lunch || day.dinner || day.steps || day.type || day.caloriesBurnt || day.cardioOn)) {
-      result[idx] = day;
+    if (day && (day.breakfast || day.lunch || day.dinner || day.steps || day.type || day.caloriesBurnt || day.cardioOn || day.cardioMin)) {
+      const cleaned = {};
+      if (day.breakfast) cleaned.breakfast = day.breakfast;
+      if (day.lunch) cleaned.lunch = day.lunch;
+      if (day.dinner) cleaned.dinner = day.dinner;
+      if (day.cardioOn) cleaned.cardioOn = true;
+      if (day.cardioMin) cleaned.cardioMin = day.cardioMin;
+      if (day.type) cleaned.type = day.type;
+      if (day.caloriesBurnt) cleaned.caloriesBurnt = day.caloriesBurnt;
+      if (day.steps) cleaned.steps = day.steps;
+      result[idx] = cleaned;
     }
   }
   return result;
 }
 
 async function fetchCloudData(pin, key) {
-  const pinKey = `${KEY_PREFIX}${pin}_${key}`;
+  const pinClean = (pin || '0000').trim();
+  const pinKey = `${pinClean}_${key}`;
 
+  // 1. Essayer kvdb.io (base POST/PUT sans limite d'URL GET)
   try {
-    const res = await fetch(`https://keyvalue.imsky.org/api/current/get/${pinKey}`, { cache: 'no-store' });
+    const res = await fetch(`https://kvdb.io/${KV_BUCKET}/${pinKey}`, { cache: 'no-store' });
+    if (res.ok) {
+      const text = await res.text();
+      if (text && text.trim().length > 0 && text !== 'null') {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === 'object') return parsed;
+      }
+    }
+  } catch (e) {
+    console.warn('kvdb fetch warning:', e);
+  }
+
+  // 2. Secours : imsky
+  try {
+    const imskyKey = `${IMSKY_PREFIX}${pinClean}_${key}`;
+    const res = await fetch(`https://keyvalue.imsky.org/api/current/get/${imskyKey}`, { cache: 'no-store' });
     if (res.ok) {
       const text = await res.text();
       if (text && text !== '""' && text !== 'null' && text.trim().length > 0) {
@@ -59,24 +87,45 @@ async function fetchCloudData(pin, key) {
       }
     }
   } catch (e) {
-    console.warn('Cloud fetch warning:', e);
+    console.warn('imsky fetch warning:', e);
   }
+
   return null;
 }
 
 async function saveCloudData(pin, key, value) {
-  const pinKey = `${KEY_PREFIX}${pin}_${key}`;
+  const pinClean = (pin || '0000').trim();
+  const pinKey = `${pinClean}_${key}`;
   const compressedVal = key === 'jours' ? compressDays(value) : value;
   const strVal = JSON.stringify(compressedVal);
-  const encodedVal = encodeURIComponent(strVal);
 
+  let success = false;
+
+  // 1. Sauvegarder sur kvdb.io via POST body (supporte les grosses charges de données)
   try {
-    const res = await fetch(`https://keyvalue.imsky.org/api/current/set/${pinKey}/${encodedVal}`);
-    return res.ok;
+    const res = await fetch(`https://kvdb.io/${KV_BUCKET}/${pinKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: strVal,
+    });
+    if (res.ok) success = true;
   } catch (e) {
-    console.warn('Cloud save warning:', e);
-    return false;
+    console.warn('kvdb save warning:', e);
   }
+
+  // 2. Secours sur imsky pour les petites tailles
+  if (strVal.length < 1500) {
+    try {
+      const imskyKey = `${IMSKY_PREFIX}${pinClean}_${key}`;
+      const encodedVal = encodeURIComponent(strVal);
+      const res = await fetch(`https://keyvalue.imsky.org/api/current/set/${imskyKey}/${encodedVal}`);
+      if (res.ok) success = true;
+    } catch (e) {
+      console.warn('imsky save warning:', e);
+    }
+  }
+
+  return success;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -183,6 +232,12 @@ export default function App() {
   const [syncStatus, setSyncStatus] = useState('loading'); // 'synced' | 'loading' | 'saving' | 'error'
   const [syncing, setSyncing] = useState(false);
 
+  /* --- Export / Import & Modal Code --- */
+  const fileInputRef = useRef(null);
+  const [showCodeModal, setShowCodeModal] = useState(false);
+  const [textCodeInput, setTextCodeInput] = useState('');
+  const [copyFeedback, setCopyFeedback] = useState(false);
+
   const defaultDay = todayDayIndex();
   const defaultWeek = weekIndexForDay(defaultDay);
 
@@ -201,7 +256,7 @@ export default function App() {
 
   /* --- Chargement depuis le Cloud avec le PIN --- */
   const loadFromCloud = useCallback(async (pinToUse) => {
-    const targetPin = pinToUse || pinCode || '0000';
+    const targetPin = (pinToUse || pinCode || '0000').trim();
     setSyncing(true);
     setSyncStatus('loading');
     try {
@@ -234,7 +289,28 @@ export default function App() {
     }
   }, [pinCode]);
 
-  /* --- Initialisation séquentielle sans écrasement --- */
+  /* --- Pousser manuellement vers le Cloud --- */
+  const pushToCloud = useCallback(async (pinToUse) => {
+    const targetPin = (pinToUse || pinCode || '0000').trim();
+    setSyncing(true);
+    setSyncStatus('saving');
+    try {
+      await Promise.all([
+        saveCloudData(targetPin, 'jours', daysData),
+        saveCloudData(targetPin, 'poids', weeklyWeights)
+      ]);
+      setSyncStatus('synced');
+      flashSaved();
+      alert(`✅ Données envoyées au Cloud avec succès (PIN ${targetPin}) !`);
+    } catch (e) {
+      setSyncStatus('error');
+      alert('❌ Erreur lors de l’envoi des données au Cloud.');
+    } finally {
+      setSyncing(false);
+    }
+  }, [pinCode, daysData, weeklyWeights, flashSaved]);
+
+  /* --- Initialisation séquentielle au démarrage --- */
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -257,7 +333,7 @@ export default function App() {
         }
       } catch (e) {}
 
-      const activePin = localStorage.getItem('pin_code') || '0000';
+      const activePin = (localStorage.getItem('pin_code') || '0000').trim();
       try {
         const [cloudJours, cloudPoids] = await Promise.all([
           fetchCloudData(activePin, 'jours'),
@@ -296,11 +372,17 @@ export default function App() {
   }, []);
 
   const handlePinChange = (newPin) => {
-    setPinCode(newPin);
-    localStorage.setItem('pin_code', newPin);
+    const cleanPin = newPin.trim();
+    setPinCode(cleanPin);
+    localStorage.setItem('pin_code', cleanPin);
   };
 
-  /* --- Sauvegarde automatique post-initialisation --- */
+  const handlePinBlur = () => {
+    // Recharger depuis le cloud dès qu'on sort du champ PIN
+    loadFromCloud(pinCode);
+  };
+
+  /* --- Sauvegarde automatique post-initialisation sur modif des données --- */
   useEffect(() => {
     if (!loaded || !cloudReady || isInitialMount.current) return;
 
@@ -312,7 +394,7 @@ export default function App() {
         localStorage.setItem('poids', JSON.stringify(weeklyWeights));
 
         setSyncStatus('saving');
-        const activePin = pinCode || '0000';
+        const activePin = (pinCode || '0000').trim();
         await saveCloudData(activePin, 'jours', daysData);
         await saveCloudData(activePin, 'poids', weeklyWeights);
         setSyncStatus('synced');
@@ -320,10 +402,157 @@ export default function App() {
       } catch (e) {
         setSyncStatus('error');
       }
-    }, 500);
+    }, 800);
 
     return () => clearTimeout(saveTimer.current);
-  }, [daysData, weeklyWeights, loaded, cloudReady, pinCode, flashSaved]);
+  }, [daysData, weeklyWeights, loaded, cloudReady, flashSaved]);
+
+  /* --- Gestion des Exports / Imports --- */
+  const handleExportJSON = () => {
+    try {
+      const payload = {
+        app: '90days',
+        version: '3.0',
+        exportDate: new Date().toISOString(),
+        pinCode: pinCode || '0000',
+        jours: daysData,
+        poids: weeklyWeights,
+      };
+
+      const dataStr = JSON.stringify(payload, null, 2);
+      const blob = new Blob([dataStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+
+      const link = document.createElement('a');
+      const dateTag = new Date().toISOString().slice(0, 10);
+      link.href = url;
+      link.download = `90days_backup_${dateTag}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      alert("Erreur lors de l'exportation : " + err.message);
+    }
+  };
+
+  const handleImportJSONClick = () => {
+    if (fileInputRef.current) {
+      fileInputRef.current.click();
+    }
+  };
+
+  const handleFileChange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      try {
+        const text = event.target?.result;
+        if (!text || typeof text !== 'string') return;
+        const parsed = JSON.parse(text);
+
+        const importedJours = parsed.jours || (parsed[1] || parsed.breakfast ? parsed : null);
+        const importedPoids = parsed.poids || null;
+        const importedPin = parsed.pinCode;
+
+        if (!importedJours && !importedPoids) {
+          alert("❌ Le fichier sélectionné ne contient pas de données 90days valides.");
+          return;
+        }
+
+        if (window.confirm("Remplacer vos données actuelles par les données importées ?")) {
+          if (importedJours) {
+            setDaysData(importedJours);
+            localStorage.setItem('jours', JSON.stringify(importedJours));
+          }
+          if (importedPoids) {
+            setWeeklyWeights(importedPoids);
+            localStorage.setItem('poids', JSON.stringify(importedPoids));
+          }
+          if (importedPin) {
+            setPinCode(importedPin);
+            localStorage.setItem('pin_code', importedPin);
+          }
+
+          const targetPin = (importedPin || pinCode || '0000').trim();
+          setSyncStatus('saving');
+          if (importedJours) await saveCloudData(targetPin, 'jours', importedJours);
+          if (importedPoids) await saveCloudData(targetPin, 'poids', importedPoids);
+          setSyncStatus('synced');
+          flashSaved();
+
+          alert("✅ Données restaurées et synchronisées au Cloud avec succès !");
+        }
+      } catch (err) {
+        alert("Erreur de lecture du fichier : " + err.message);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  const handleCopyCode = () => {
+    try {
+      const payload = {
+        jours: daysData,
+        poids: weeklyWeights,
+        pinCode: pinCode || '0000',
+      };
+      const jsonStr = JSON.stringify(payload);
+      navigator.clipboard.writeText(jsonStr);
+      setCopyFeedback(true);
+      setTimeout(() => setCopyFeedback(false), 2000);
+    } catch (e) {
+      alert("Impossible de copier dans le presse-papier.");
+    }
+  };
+
+  const handleImportTextCode = async () => {
+    if (!textCodeInput.trim()) {
+      alert("Veuillez coller un code texte de sauvegarde.");
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(textCodeInput.trim());
+      const importedJours = parsed.jours || (parsed[1] ? parsed : null);
+      const importedPoids = parsed.poids || null;
+      const importedPin = parsed.pinCode;
+
+      if (!importedJours && !importedPoids) {
+        alert("❌ Le code collé ne contient pas de données valides.");
+        return;
+      }
+
+      if (importedJours) {
+        setDaysData(importedJours);
+        localStorage.setItem('jours', JSON.stringify(importedJours));
+      }
+      if (importedPoids) {
+        setWeeklyWeights(importedPoids);
+        localStorage.setItem('poids', JSON.stringify(importedPoids));
+      }
+      if (importedPin) {
+        setPinCode(importedPin);
+        localStorage.setItem('pin_code', importedPin);
+      }
+
+      const targetPin = (importedPin || pinCode || '0000').trim();
+      setSyncStatus('saving');
+      if (importedJours) await saveCloudData(targetPin, 'jours', importedJours);
+      if (importedPoids) await saveCloudData(targetPin, 'poids', importedPoids);
+      setSyncStatus('synced');
+      flashSaved();
+
+      setShowCodeModal(false);
+      setTextCodeInput('');
+      alert("✅ Code appliqué et données synchronisées !");
+    } catch (err) {
+      alert("❌ Code invalide ou mal formaté.");
+    }
+  };
 
   const updateDay = (index, patch) => {
     setDaysData(prev => ({
@@ -383,38 +612,126 @@ export default function App() {
           <span>Jour {currentDayIdx} sur {TOTAL_DAYS}</span>
         </div>
 
-        {/* BARRE DE SYNCHRONISATION CLOUD */}
+        {/* BARRE DE SYNCHRONISATION ET SAUVEGARDE */}
         <div className="cloud-sync-bar">
-          <div className="cloud-pin-wrap">
-            <span className="cloud-icon"><Cloud size={17} /></span>
-            <span className="cloud-label">Code PIN Synchro :</span>
-            <input
-              type="text"
-              className="pin-input"
-              value={pinCode}
-              maxLength={6}
-              onChange={(e) => handlePinChange(e.target.value)}
-              placeholder="0000"
-              title="Saisissez ce même code PIN sur n'importe quel navigateur pour retrouver vos données"
-            />
-            <button
-              type="button"
-              className="sync-btn"
-              onClick={() => loadFromCloud(pinCode)}
-              disabled={syncing}
-              title="Charger les données enregistrées dans le Cloud avec ce PIN"
-            >
-              <RefreshCw size={14} className={syncing ? 'spin' : ''} />
-              {syncing ? 'Synchro...' : 'Recharger'}
-            </button>
+          <div className="cloud-sync-top">
+            <div className="cloud-pin-wrap">
+              <span className="cloud-icon"><Cloud size={18} /></span>
+              <span className="cloud-label">PIN Synchro :</span>
+              <input
+                type="text"
+                className="pin-input"
+                value={pinCode}
+                maxLength={6}
+                onChange={(e) => handlePinChange(e.target.value)}
+                onBlur={handlePinBlur}
+                placeholder="0000"
+                title="Entrez ce même code PIN sur votre téléphone et PC"
+              />
+              <button
+                type="button"
+                className="sync-btn"
+                onClick={() => loadFromCloud(pinCode)}
+                disabled={syncing}
+                title="Recharger les données enregistrées dans le Cloud avec ce PIN"
+              >
+                <CloudDownload size={14} className={syncing ? 'spin' : ''} />
+                {syncing ? 'Synchro...' : 'Recharger'}
+              </button>
+
+              <button
+                type="button"
+                className="sync-btn push-btn"
+                onClick={() => pushToCloud(pinCode)}
+                disabled={syncing}
+                title="Envoyer vos données actuelles au Cloud avec ce PIN"
+              >
+                <CloudUpload size={14} />
+                Envoyer au Cloud
+              </button>
+            </div>
+
+            <div className="backup-actions">
+              <button
+                type="button"
+                className="backup-btn export"
+                onClick={handleExportJSON}
+                title="Télécharger un fichier de sauvegarde JSON"
+              >
+                <Download size={14} />
+                Exporter JSON
+              </button>
+
+              <button
+                type="button"
+                className="backup-btn import"
+                onClick={handleImportJSONClick}
+                title="Importer un fichier de sauvegarde JSON"
+              >
+                <Upload size={14} />
+                Importer JSON
+              </button>
+
+              <input
+                type="file"
+                ref={fileInputRef}
+                onChange={handleFileChange}
+                accept=".json"
+                style={{ display: 'none' }}
+              />
+
+              <button
+                type="button"
+                className="backup-btn code-btn"
+                onClick={() => setShowCodeModal(!showCodeModal)}
+                title="Copier ou coller le code texte des données"
+              >
+                <FileText size={14} />
+                Copier/Coller Code
+              </button>
+            </div>
           </div>
 
-          <div className="cloud-status">
-            {syncStatus === 'synced' && <><Check size={14} className="status-check" /> Synchro Cloud Active (PIN: <strong>{pinCode || '0000'}</strong>)</>}
-            {syncStatus === 'loading' && <><RefreshCw size={14} className="spin" /> Connexion au Cloud...</>}
-            {syncStatus === 'saving' && <><Cloud size={14} /> Enregistrement Cloud...</>}
-            {syncStatus === 'error' && <span className="error-text">Mode Hors-ligne (Données locales conservées)</span>}
+          <div className="cloud-status-row">
+            <div className="cloud-status">
+              {syncStatus === 'synced' && <><Check size={14} className="status-check" /> Synchro Cloud Active (PIN: <strong>{pinCode || '0000'}</strong>)</>}
+              {syncStatus === 'loading' && <><RefreshCw size={14} className="spin" /> Connexion au Cloud...</>}
+              {syncStatus === 'saving' && <><Cloud size={14} /> Enregistrement Cloud...</>}
+              {syncStatus === 'error' && <span className="error-text">Mode Hors-ligne (Données locales conservées)</span>}
+            </div>
           </div>
+
+          {/* Modal / Zone de Copier-Coller */}
+          {showCodeModal && (
+            <div className="code-modal-panel">
+              <div className="code-modal-header">
+                <h4><Copy size={16} /> Copier ou Coller vos données directement</h4>
+                <button type="button" className="close-code-btn" onClick={() => setShowCodeModal(false)}>✕</button>
+              </div>
+              <div className="code-modal-body">
+                <div className="code-modal-step">
+                  <p><strong>Option 1 : Copier tout le code de sauvegarde</strong></p>
+                  <button type="button" className="copy-action-btn" onClick={handleCopyCode}>
+                    <Copy size={14} /> {copyFeedback ? 'Code copié dans le presse-papier !' : 'Copier le Code de Sauvegarde'}
+                  </button>
+                </div>
+                <div className="code-modal-divider" />
+                <div className="code-modal-step">
+                  <p><strong>Option 2 : Coller un code reçu d\'un autre appareil</strong></p>
+                  <textarea
+                    className="code-textarea"
+                    placeholder="Collez ici le texte JSON de sauvegarde..."
+                    value={textCodeInput}
+                    onChange={(e) => setTextCodeInput(e.target.value)}
+                    rows={3}
+                  />
+                  <button type="button" className="apply-code-btn" onClick={handleImportTextCode}>
+                    <Check size={14} /> Restituer et Synchroniser
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="tick-overview" aria-hidden="true">
@@ -723,35 +1040,89 @@ const STYLES = `
 .hero-dates .arrow { color: var(--text-faint); }
 .hero-dates .dot { color: var(--text-faint); }
 
-/* ---------- cloud sync bar ---------- */
+/* ---------- cloud sync bar & backup ---------- */
 .cloud-sync-bar {
-  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  display: flex; flex-direction: column; gap: 12px;
   background: var(--surface-2); border: 1px solid var(--border-strong);
-  border-radius: 10px; padding: 10px 16px; margin-bottom: 22px; flex-wrap: wrap;
+  border-radius: 12px; padding: 14px 16px; margin-bottom: 22px;
+}
+.cloud-sync-top {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
 }
 .cloud-pin-wrap { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .cloud-icon { color: var(--blue); display: flex; align-items: center; }
 .cloud-label { font-size: 13.5px; font-weight: 600; color: var(--text); }
 .pin-input {
   width: 65px; background: var(--surface); border: 1px solid var(--amber-border);
-  border-radius: 6px; padding: 4px 6px; color: var(--amber);
+  border-radius: 6px; padding: 5px 6px; color: var(--amber);
   font-family: 'Big Shoulders Display', sans-serif; font-size: 16px; font-weight: 800;
   text-align: center; letter-spacing: 1px;
 }
 .pin-input:focus { outline: none; border-color: var(--amber); }
+
 .sync-btn {
   display: flex; align-items: center; gap: 6px; background: var(--blue-soft);
   color: var(--blue); border: 1px solid var(--blue-border); border-radius: 6px;
-  padding: 5px 12px; font-size: 12.5px; font-weight: 700; cursor: pointer;
+  padding: 6px 12px; font-size: 12.5px; font-weight: 700; cursor: pointer;
   transition: all 0.15s ease;
 }
 .sync-btn:hover { background: var(--blue); color: #0b0d10; }
+.sync-btn.push-btn {
+  background: var(--amber-soft); color: var(--amber); border-color: var(--amber-border);
+}
+.sync-btn.push-btn:hover { background: var(--amber); color: #0b0d10; }
 .sync-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.backup-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.backup-btn {
+  display: flex; align-items: center; gap: 6px;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border-strong); border-radius: 6px;
+  padding: 6px 12px; font-size: 12.5px; font-weight: 600; cursor: pointer;
+  transition: all 0.15s ease;
+}
+.backup-btn:hover { background: var(--surface-2); border-color: var(--blue); color: var(--blue); }
+.backup-btn.export:hover { border-color: var(--green); color: var(--green); }
+.backup-btn.import:hover { border-color: var(--amber); color: var(--amber); }
+.backup-btn.code-btn:hover { border-color: var(--blue); color: var(--blue); }
+
+.cloud-status-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  border-top: 1px dashed var(--border); padding-top: 8px;
+}
 .cloud-status { font-size: 12.5px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; }
 .status-check { color: var(--green); }
 .error-text { color: #ff6b6b; }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { 100% { transform: rotate(360deg); } }
+
+/* Modal Code Texte */
+.code-modal-panel {
+  background: var(--surface); border: 1px solid var(--blue-border);
+  border-radius: 10px; padding: 14px; margin-top: 6px;
+  animation: fadeIn 0.2s ease;
+}
+@keyframes fadeIn { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: translateY(0); } }
+.code-modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.code-modal-header h4 { margin: 0; font-size: 14px; font-weight: 700; color: var(--blue); display: flex; align-items: center; gap: 8px; }
+.close-code-btn { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 16px; font-weight: bold; }
+.close-code-btn:hover { color: var(--text); }
+.code-modal-body { display: flex; flex-direction: column; gap: 14px; }
+.code-modal-step p { margin: 0 0 8px; font-size: 13px; color: var(--text); }
+.copy-action-btn, .apply-code-btn {
+  display: flex; align-items: center; gap: 6px;
+  background: var(--blue); color: #0b0d10; border: none; border-radius: 6px;
+  padding: 8px 14px; font-size: 13px; font-weight: 700; cursor: pointer;
+  transition: opacity 0.15s;
+}
+.copy-action-btn:hover, .apply-code-btn:hover { opacity: 0.9; }
+.code-modal-divider { height: 1px; background: var(--border); }
+.code-textarea {
+  width: 100%; background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px; color: var(--text); font-family: monospace; font-size: 12px;
+  resize: vertical; margin-bottom: 8px;
+}
+.code-textarea:focus { outline: none; border-color: var(--blue); }
 
 .tick-overview {
   display: grid;
